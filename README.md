@@ -56,8 +56,8 @@ The testing suite consists of four key components designed to comprehensively te
 
 ### Core Testing Framework
 ```
-Primary Languages: Python/Java
-Testing Frameworks: pytest/TestNG
+Primary Languages: Python
+Testing Frameworks: pytest
 Orchestration: Apache Airflow (optional for complex workflows)
 ```
 
