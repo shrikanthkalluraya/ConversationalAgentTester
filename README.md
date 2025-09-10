@@ -56,8 +56,8 @@ The testing suite consists of four key components designed to comprehensively te
 
 ### Core Testing Framework
 ```
-Primary Languages: Python
-Testing Frameworks: pytest
+Primary Languages: Python/Java
+Testing Frameworks: pytest/TestNG
 Orchestration: Apache Airflow (optional for complex workflows)
 ```
 
@@ -598,14 +598,15 @@ alert_rules:
    - Documentation completion
 
 ### Quick Start Checklist
-- [ ] GCP project with necessary APIs enabled
-- [ ] Twilio account configured
-- [ ] Basic Python environment set up
-- [ ] First test scenario defined
-- [ ] Simple call simulation working
-- [ ] Basic validation implemented
-- [ ] CI/CD pipeline configured
-- [ ] Initial reporting dashboard created
+- [ ] GCP project with Speech-to-Text and Text-to-Speech APIs enabled
+- [ ] Service account with appropriate permissions created
+- [ ] Basic Python environment with GCP client libraries
+- [ ] First test scenario with conversation script defined
+- [ ] TTS audio generation working
+- [ ] STT transcription validation implemented
+- [ ] Basic audio quality simulation setup
+- [ ] CI/CD pipeline configured for GCP integration
+- [ ] Initial performance metrics dashboard created
 
 ---
 
