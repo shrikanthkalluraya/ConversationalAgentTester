@@ -1,0 +1,107 @@
+{
+  "flow_id": "customer_support_basic",
+  "flow_name": "Customer Support - Basic Flow",
+  "description": "Tests basic customer support interaction with account help",
+  "agent_id": "customer_service",
+  "language_code": "en",
+  "steps": [
+    {
+      "step_id": "greeting",
+      "user_input": "Hello, I need help with my account",
+      "expected_intent": "account.help",
+      "expected_response_contains": ["help", "assist"],
+      "validation_rules": [
+        {
+          "field": "intent_confidence",
+          "operator": "gte",
+          "expected_value": 0.7,
+          "assertion_level": "critical",
+          "message": "Intent confidence must be at least 0.7"
+        },
+        {
+          "field": "execution_time_ms",
+          "operator": "lt",
+          "expected_value": 2000,
+          "assertion_level": "warning",
+          "message": "Response time should be under 2 seconds"
+        }
+      ],
+      "continue_on_failure": false,
+      "timeout_seconds": 30
+    },
+    {
+      "step_id": "provide_account_number",
+      "user_input": "My account number is 12345678",
+      "expected_intent": "account.provide_number",
+      "expected_entities": {
+        "account_number": "12345678"
+      },
+      "validation_rules": [
+        {
+          "field": "parameters.account_number",
+          "operator": "equals",
+          "expected_value": "12345678",
+          "assertion_level": "critical"
+        },
+        {
+          "field": "intent",
+          "operator": "contains",
+          "expected_value": "account",
+          "assertion_level": "error"
+        }
+      ],
+      "continue_on_failure": false
+    },
+    {
+      "step_id": "request_verification",
+      "user_input": "I need to verify my identity",
+      "expected_intent": "security.verify",
+      "validation_rules": [
+        {
+          "field": "intent_confidence",
+          "operator": "gte",
+          "expected_value": 0.6,
+          "assertion_level": "error"
+        }
+      ],
+      "continue_on_failure": true,
+      "metadata": {
+        "category": "security",
+        "priority": "high"
+      }
+    },
+    {
+      "step_id": "closing",
+      "user_input": "Thank you for your help",
+      "expected_intent": "conversation.end",
+      "validation_rules": [
+        {
+          "field": "intent",
+          "operator": "in",
+          "expected_value": ["conversation.end", "goodbye", "thanks"],
+          "assertion_level": "warning"
+        }
+      ]
+    }
+  ],
+  "global_validation_rules": [
+    {
+      "field": "execution_time_ms",
+      "operator": "lt",
+      "expected_value": 3000,
+      "assertion_level": "warning",
+      "message": "All responses should be under 3 seconds"
+    }
+  ],
+  "success_criteria": {
+    "completion_rate": 0.95,
+    "average_response_time": 1500,
+    "intent_accuracy": 0.90
+  },
+  "metadata": {
+    "category": "customer_support",
+    "priority": "high",
+    "author": "test_team",
+    "version": "1.0"
+  }
+}
