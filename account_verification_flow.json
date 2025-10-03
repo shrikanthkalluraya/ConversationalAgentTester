@@ -1,0 +1,54 @@
+{
+  "flow_id": "account_verification",
+  "flow_name": "Account Verification Flow",
+  "description": "Tests multi-step account verification process",
+  "agent_id": "customer_service",
+  "language_code": "en",
+  "steps": [
+    {
+      "step_id": "init_verification",
+      "user_input": "I need to verify my account",
+      "expected_intent": "account.verify",
+      "validation_rules": [
+        {
+          "field": "intent_confidence",
+          "operator": "gte",
+          "expected_value": 0.8,
+          "assertion_level": "critical",
+          "message": "CRITICAL: Must recognize verification intent"
+        }
+      ]
+    },
+    {
+      "step_id": "provide_email",
+      "user_input": "My email is john.doe@example.com",
+      "expected_intent": "account.provide_email",
+      "validation_rules": [
+        {
+          "field": "parameters.email",
+          "operator": "regex",
+          "expected_value": ".*@.*\\..*",
+          "assertion_level": "critical",
+          "message": "Must extract valid email format"
+        }
+      ]
+    },
+    {
+      "step_id": "provide_phone",
+      "user_input": "My phone number is 555-1234",
+      "expected_intent": "account.provide_phone",
+      "validation_rules": [
+        {
+          "field": "parameters.phone",
+          "operator": "contains",
+          "expected_value": "555",
+          "assertion_level": "critical"
+        }
+      ]
+    }
+  ],
+  "success_criteria": {
+    "all_steps_passed": true,
+    "intent_accuracy": 0.95
+  }
+}
