@@ -1,0 +1,30 @@
+{
+  "flow_id": "template_basic",
+  "flow_name": "Basic Template Flow",
+  "description": "Minimal template for creating new flows",
+  "agent_id": null,
+  "language_code": "en",
+  "steps": [
+    {
+      "step_id": "step_1",
+      "user_input": "Your user input here",
+      "expected_intent": "expected.intent.name",
+      "validation_rules": [
+        {
+          "field": "intent_confidence",
+          "operator": "gte",
+          "expected_value": 0.7,
+          "assertion_level": "critical"
+        }
+      ]
+    }
+  ],
+  "global_validation_rules": [
+    {
+      "field": "execution_time_ms",
+      "operator": "lt",
+      "expected_value": 5000,
+      "assertion_level": "warning"
+    }
+  ]
+}
