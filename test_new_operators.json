@@ -1,0 +1,36 @@
+{
+  "flow_id": "test_new_operators",
+  "flow_name": "Test CONTAINS_ALL and CONTAINS_ANY",
+  "description": "Quick test of new validation operators",
+  "agent_id": "customer_service",
+  "steps": [
+    {
+      "step_id": "test_contains_all",
+      "user_input": "I need help with billing and account issues",
+      "expected_intent": "help",
+      "validation_rules": [
+        {
+          "field": "response_messages",
+          "operator": "contains_all",
+          "expected_value": ["help", "assist"],
+          "assertion_level": "warning",
+          "message": "Response should mention both 'help' and 'assist'"
+        }
+      ]
+    },
+    {
+      "step_id": "test_contains_any",
+      "user_input": "Hello there",
+      "expected_intent": "greeting",
+      "validation_rules": [
+        {
+          "field": "response_messages",
+          "operator": "contains_any",
+          "expected_value": ["hello", "hi", "greetings", "welcome"],
+          "assertion_level": "warning",
+          "message": "Response should include at least one greeting"
+        }
+      ]
+    }
+  ]
+}
