@@ -225,8 +225,8 @@ class AssertionValidator:
             return False
     
     def _generate_default_message(self, field: str, actual: Any, 
-                                  expected: Any, operator: ValidationOperator, 
-                                  passed: bool) -> str:
+                              expected: Any, operator: ValidationOperator, 
+                              passed: bool) -> str:
         """Generate default assertion message"""
         status = "✓" if passed else "✗"
         
@@ -234,6 +234,8 @@ class AssertionValidator:
             ValidationOperator.EQUALS: "should equal",
             ValidationOperator.NOT_EQUALS: "should not equal",
             ValidationOperator.CONTAINS: "should contain",
+            ValidationOperator.CONTAINS_ALL: "should contain all of",      # ← ADD
+            ValidationOperator.CONTAINS_ANY: "should contain any of",      # ← ADD
             ValidationOperator.GREATER_THAN: "should be greater than",
             ValidationOperator.LESS_THAN: "should be less than",
             ValidationOperator.GREATER_EQUAL: "should be >= ",
@@ -242,8 +244,20 @@ class AssertionValidator:
             ValidationOperator.IN_LIST: "should be in"
         }.get(operator, "should match")
         
-        return (f"{status} {field} {op_text} '{expected}' "
-                f"(actual: '{actual}')")
+        # Format expected value for display
+        if isinstance(expected, (list, tuple)):
+            expected_display = f"[{', '.join(repr(x) for x in expected)}]"
+        else:
+            expected_display = repr(expected)
+        
+        # Format actual value (truncate if too long)
+        if isinstance(actual, str) and len(actual) > 50:
+            actual_display = repr(actual[:50] + "...")
+        else:
+            actual_display = repr(actual)
+        
+        return (f"{status} {field} {op_text} {expected_display} "
+                f"(actual: {actual_display})")
     
     def generate_report(self, step_results: List[StepValidationResult]) -> Dict[str, Any]:
         """
