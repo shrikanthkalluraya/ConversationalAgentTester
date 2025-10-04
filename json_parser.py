@@ -15,6 +15,8 @@ class ValidationOperator(Enum):
     """Operators for validation rules"""
     EQUALS = "equals"
     CONTAINS = "contains"
+    CONTAINS_ALL = "contains_all"
+    CONTAINS_ANY = "contains_any"
     GREATER_THAN = "gt"
     LESS_THAN = "lt"
     GREATER_EQUAL = "gte"
