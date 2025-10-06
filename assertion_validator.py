@@ -175,24 +175,23 @@ class AssertionValidator:
                 else:
                     self.logger.warning(f"CONTAINS_ALL: unsupported type {type(actual)}")
                     return False
-            elif operator == ValidationOperator.CONTAINS_ALL:
+            elif operator == ValidationOperator.CONTAINS_ANY:
                 if not isinstance(expected, (list, tuple)):
-                    self.logger.warning(f"CONTAINS_ALL expects a list, got {type(expected)}")
+                    self.logger.warning(f"CONTAINS_ANY expects a list, got {type(expected)}")
                     return False
                 
                 if isinstance(actual, str):
                     actual_lower = actual.lower()
-                    return all(str(item).lower() in actual_lower for item in expected)
+                    return any(str(item).lower() in actual_lower for item in expected)
                 
                 elif isinstance(actual, (list, tuple)):
-                    return all(item in actual for item in expected)
+                    return any(item in actual for item in expected)
                 
                 elif isinstance(actual, set):
-                    return set(expected).issubset(actual)
-                
-                else:
-                    self.logger.warning(f"CONTAINS_ALL: unsupported type {type(actual)}")
-                    return False
+                    return bool(set(expected).intersection(actual))  
+            else:
+                self.logger.warning(f"CONTAINS_ANY: unsupported type {type(actual)}")
+                return False
             
             elif operator == ValidationOperator.GREATER_THAN:
                 return float(actual) > float(expected)
