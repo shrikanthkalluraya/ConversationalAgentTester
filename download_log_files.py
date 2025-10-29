@@ -1,3 +1,11 @@
+'''
+Required IAM Permissions: Your service account needs:
+
+logging.logEntries.list
+logging.logs.list
+
+'''
+
 from google.cloud import logging
 from datetime import datetime, timedelta
 import pytz
