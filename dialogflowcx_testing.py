@@ -31,6 +31,7 @@ CHUNK_SECONDS = 0.1
 DEFAULT_LANGUAGE_CODE = "en-US"
 DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_DIALOGFLOW_TIMEOUT = 60.0
+STREAMING_DELAY_RATIO = 0.8  # Send audio slightly faster than real-time
 
 
 def get_current_time() -> int:
@@ -41,9 +42,10 @@ def get_current_time() -> int:
 class WavFileReader:
     """Reads WAV files and streams them as audio chunks."""
 
-    def __init__(self, wav_file_path: str, chunk_size: int) -> None:
+    def __init__(self, wav_file_path: str, chunk_size: int, streaming_delay_ratio: float = 0.8) -> None:
         self.wav_file_path = wav_file_path
         self.chunk_size = chunk_size
+        self.streaming_delay_ratio = streaming_delay_ratio
         self._buff = asyncio.Queue()
         self.closed = False
         self.start_time = None
@@ -73,14 +75,18 @@ class WavFileReader:
                 
                 self.start_time = get_current_time()
                 
+                # Stream audio close to real-time to avoid "Audio timeout" errors
+                # Use the configured delay ratio (default 0.8 = 80% of real-time = slightly faster)
+                chunk_duration = CHUNK_SECONDS * self.streaming_delay_ratio
+                
                 while not self.closed:
                     data = wf.readframes(self.chunk_size)
                     if not data:
                         break
                     
                     await self._buff.put(data)
-                    # Simulate real-time streaming
-                    await asyncio.sleep(CHUNK_SECONDS)
+                    # Send audio close to real-time to avoid timeout
+                    await asyncio.sleep(chunk_duration)
                 
                 # Signal end of file
                 await self._buff.put(None)
@@ -303,13 +309,14 @@ async def process_wav_file(
     dialogflow_streaming: DialogflowCXStreaming,
     wav_file_path: str,
     chunk_size: int,
+    streaming_delay_ratio: float = 0.8,
 ) -> DialogflowResponse:
     """Process a single WAV file and return the response."""
     
     result = DialogflowResponse()
     audio_queue = asyncio.Queue()
     
-    with WavFileReader(wav_file_path, chunk_size) as wav_reader:
+    with WavFileReader(wav_file_path, chunk_size, streaming_delay_ratio) as wav_reader:
         # Start reading WAV file
         read_task = asyncio.create_task(wav_reader.read_wav_file())
         push_task = asyncio.create_task(
@@ -392,9 +399,11 @@ class TestFlowManager:
         self,
         dialogflow_streaming: DialogflowCXStreaming,
         chunk_size: int,
+        streaming_delay_ratio: float = 0.8,
     ):
         self.dialogflow_streaming = dialogflow_streaming
         self.chunk_size = chunk_size
+        self.streaming_delay_ratio = streaming_delay_ratio
         self.responses: list[DialogflowResponse] = []
     
     async def send_audio(self, wav_file_path: str) -> DialogflowResponse:
@@ -406,7 +415,8 @@ class TestFlowManager:
         response = await process_wav_file(
             self.dialogflow_streaming,
             wav_file_path,
-            self.chunk_size
+            self.chunk_size,
+            self.streaming_delay_ratio
         )
         
         self.responses.append(response)
@@ -524,6 +534,7 @@ async def main(
     voice: str | None = None,
     sample_rate: int = DEFAULT_SAMPLE_RATE,
     dialogflow_timeout: float = DEFAULT_DIALOGFLOW_TIMEOUT,
+    streaming_delay_ratio: float = STREAMING_DELAY_RATIO,
     debug: bool = False,
 ) -> None:
     """Main function to run WAV file testing."""
@@ -541,7 +552,7 @@ async def main(
         debug,
     )
     
-    flow_manager = TestFlowManager(dialogflow_streaming, chunk_size)
+    flow_manager = TestFlowManager(dialogflow_streaming, chunk_size, streaming_delay_ratio)
     
     logger.info(f"Starting test flow at {get_current_time() / 1000}")
     logger.info(f"Session ID: {dialogflow_streaming.session_id}")
@@ -617,6 +628,12 @@ if __name__ == "__main__":
         help="Dialogflow API timeout in seconds (default: 60)",
     )
     parser.add_argument(
+        "--streaming_delay_ratio",
+        type=float,
+        default=STREAMING_DELAY_RATIO,
+        help="Audio streaming speed ratio (default: 0.8 = 80%% of real-time, faster to avoid timeout)",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
@@ -634,6 +651,7 @@ if __name__ == "__main__":
             args.voice,
             args.sample_rate,
             args.dialogflow_timeout,
+            args.streaming_delay_ratio,
             args.debug,
         )
     )
