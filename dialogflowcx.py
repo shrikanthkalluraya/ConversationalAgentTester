@@ -115,9 +115,7 @@ class AudioIO:
     def __enter__(self) -> "AudioIO":
         """Opens the stream."""
         self.closed = False
-        # If using file input, start feeding audio from file
-        if self.audio_file_path:
-            self._file_feed_task = asyncio.create_task(self._feed_audio_from_file())
+        # DO NOT start file feed task here - it will start when generator() is called
         return self
 
     def __exit__(self, *args: any) -> None:
@@ -170,11 +168,6 @@ class AudioIO:
                 # Calculate frames to read per chunk
                 frames_per_chunk = self.chunk_size
                 
-                # Calculate sleep time based on chunk duration (in seconds)
-                chunk_duration = frames_per_chunk / framerate
-                
-                logger.info(f"Chunk duration: {chunk_duration} seconds, Frames per chunk: {frames_per_chunk}")
-                
                 while not self.closed:
                     # Read frames from WAV file
                     pcm_data = wav_file.readframes(frames_per_chunk)
@@ -183,14 +176,11 @@ class AudioIO:
                         logger.info("Reached end of WAV file")
                         break
                     
-                    # Add to buffer regardless of output stream state
-                    # (removed the condition that was blocking when output is playing)
+                    # Put data into buffer - this will block if buffer is full
                     await self._buff.put(pcm_data)
                     self.audio_input.append(pcm_data)
                     
-                    # Simulate real-time playback timing with more accurate calculation
-                    # Sleep for the duration of the audio chunk to simulate real-time streaming
-                    await asyncio.sleep(chunk_duration)
+                    # DO NOT sleep here - let the consumer control the pace
                 
                 # Signal end of audio
                 await self._buff.put(None)
@@ -202,7 +192,6 @@ class AudioIO:
             logger.error(f"Audio file not found: {self.audio_file_path}")
         except Exception as e:
             logger.error(f"Error reading audio file: {e}")
-
 
     def _fill_buffer(
         self, in_data: bytes, frame_count: int, time_info: dict, status_flags: int
@@ -222,6 +211,12 @@ class AudioIO:
 
     async def generator(self) -> AsyncGenerator[bytes, None]:
         """Stream Audio from microphone/file to API and to local buffer."""
+        
+        # Start file feed task here (only once)
+        if self.audio_file_path and self._file_feed_task is None:
+            self._file_feed_task = asyncio.create_task(self._feed_audio_from_file())
+            logger.info("Started file feed task")
+        
         while not self.closed:
             try:
                 chunk = await asyncio.wait_for(self._buff.get(), timeout=1)
