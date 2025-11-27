@@ -1,3 +1,46 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+from collections.abc import AsyncGenerator
+import logging
+import os
+import signal
+import struct
+import sys
+import time
+import uuid
+import wave  # Added for WAV file support
+
+from google.api_core import retry as retries
+from google.api_core.client_options import ClientOptions
+from google.api_core.exceptions import GoogleAPIError, ServiceUnavailable
+from google.cloud import dialogflowcx_v3
+from google.protobuf.json_format import MessageToDict
+
+import pyaudio
+from termcolor import colored
+
+# TODO: Remove once GRPC log spam is gone see [https://github.com/grpc/grpc/issues/37642](https://github.com/grpc/grpc/issues/37642)
+os.environ["GRPC_VERBOSITY"] = "NONE"
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+CHUNK_SECONDS = 0.1
+DEFAULT_LANGUAGE_CODE = "en-US"
+DEFAULT_SAMPLE_RATE = 16000
+DEFAULT_DIALOGFLOW_TIMEOUT = 60.0
+
+
+def get_current_time() -> int:
+    """Return Current Time in MS."""
+    return int(round(time.time() * 1000))
+
+
 class AudioIO:
     """Audio Input / Output"""
 
@@ -11,7 +54,7 @@ class AudioIO:
         self.chunk_size = chunk_size
         self._buff = asyncio.Queue()
         self.closed = False
-        self.start_time = None
+        self.start_time = None  # only set when first audio received
         self.audio_input = []
         self._audio_interface = pyaudio.PyAudio()
         self._input_audio_stream = None
@@ -55,6 +98,7 @@ class AudioIO:
                 logger.error("Could not get default input device info. Exiting.")
                 sys.exit(1)
 
+            # setup input audio stream
             try:
                 self._input_audio_stream = self._audio_interface.open(
                     format=pyaudio.paInt16,
@@ -93,40 +137,62 @@ class AudioIO:
             self._output_audio_stream.close()
             self._output_audio_stream = None
 
+        # Signal the generator to terminate
         self._buff.put_nowait(None)
         self._audio_interface.terminate()
 
     async def _feed_audio_from_file(self) -> None:
-        """Reads PCM audio file and feeds chunks to the buffer."""
+        """Reads WAV file and feeds PCM chunks to the buffer."""
         try:
             # Capture start time
             if self.start_time is None:
                 self.start_time = get_current_time()
             
-            with open(self.audio_file_path, 'rb') as audio_file:
-                logger.info(f"Starting to read audio from file: {self.audio_file_path}")
+            with wave.open(self.audio_file_path, 'rb') as wav_file:
+                # Get WAV file parameters
+                channels = wav_file.getnchannels()
+                sample_width = wav_file.getsampwidth()
+                framerate = wav_file.getframerate()
+                n_frames = wav_file.getnframes()
+                
+                logger.info(f"WAV file info: {channels} channel(s), {sample_width} bytes/sample, {framerate} Hz, {n_frames} frames")
+                
+                # Verify the WAV file matches expected format
+                if channels != 1:
+                    logger.warning(f"WAV file has {channels} channels, expected mono (1 channel)")
+                if framerate != self._rate:
+                    logger.warning(f"WAV file sample rate is {framerate} Hz, expected {self._rate} Hz")
+                if sample_width != 2:
+                    logger.warning(f"WAV file sample width is {sample_width} bytes, expected 2 bytes (16-bit PCM)")
+                
+                logger.info(f"Starting to read audio from WAV file: {self.audio_file_path}")
+                
+                # Calculate frames to read per chunk
+                frames_per_chunk = self.chunk_size
                 
                 while not self.closed:
-                    # Read chunk_size bytes from file
-                    chunk = audio_file.read(self.chunk_size * 2)  # *2 because paInt16 is 2 bytes per sample
+                    # Read frames from WAV file
+                    pcm_data = wav_file.readframes(frames_per_chunk)
                     
-                    if not chunk:
-                        logger.info("Reached end of audio file")
+                    if not pcm_data:
+                        logger.info("Reached end of WAV file")
                         break
                     
                     # Only add to buffer when output stream is stopped (same logic as microphone)
                     if self._output_audio_stream and self._output_audio_stream.is_stopped():
-                        await self._buff.put(chunk)
+                        await self._buff.put(pcm_data)
                     
-                    self.audio_input.append(chunk)
+                    self.audio_input.append(pcm_data)
                     
                     # Simulate real-time playback timing
-                    await asyncio.sleep(self.chunk_size / self._rate)
+                    await asyncio.sleep(len(pcm_data) / (sample_width * channels * framerate))
                 
                 # Signal end of audio
                 await self._buff.put(None)
-                logger.info("Finished reading audio file")
+                logger.info("Finished reading WAV file")
                 
+        except wave.Error as e:
+            logger.error(f"WAV file error: {e}")
         except FileNotFoundError:
             logger.error(f"Audio file not found: {self.audio_file_path}")
         except Exception as e:
@@ -136,9 +202,12 @@ class AudioIO:
         self, in_data: bytes, frame_count: int, time_info: dict, status_flags: int
     ) -> tuple[None, int]:
         """Continuously collect data from the audio stream, into the buffer."""
+
+        # Capture the true start time when the first chunk is received
         if self.start_time is None:
             self.start_time = get_current_time()
 
+        # only capture microphone input when output audio stream is stopped
         if self._output_audio_stream and self._output_audio_stream.is_stopped():
             self._buff.put_nowait(in_data)
         self.audio_input.append(in_data)
@@ -161,7 +230,9 @@ class AudioIO:
                     try:
                         chunk = self._buff.get_nowait()
                         if chunk is None:
-                            logger.debug("[generator] Received None chunk (nowait), ending stream")
+                            logger.debug(
+                                "[generator] Received None chunk (nowait), ending stream"
+                            )
                             return
                         data.append(chunk)
                     except asyncio.QueueEmpty:
@@ -171,25 +242,323 @@ class AudioIO:
                 yield combined_data
 
             except asyncio.TimeoutError:
-                logger.debug("[generator] No audio chunk received within timeout, continuing...")
+                logger.debug(
+                    "[generator] No audio chunk received within timeout, continuing..."
+                )
                 continue
 
     def play_audio(self, audio_data: bytes) -> None:
         """Plays audio from the given bytes data, removing WAV header if needed."""
+        # Remove WAV header if present
         if audio_data.startswith(b"RIFF"):
             try:
+                # Attempt to unpack the WAV header to determine header size.
                 header_size = struct.calcsize("<4sI4s4sIHHIIHH4sI")
                 header = struct.unpack("<4sI4s4sIHHIIHH4sI", audio_data[:header_size])
                 logger.debug(f"WAV header detected: {header}")
-                audio_data = audio_data[header_size:]
+                audio_data = audio_data[header_size:]  # Remove the header
             except struct.error as e:
                 logger.error(f"Error unpacking WAV header: {e}")
+                # If header parsing fails, play the original data; may not be a valid WAV
 
+        # Play the raw PCM audio
         try:
             self._output_audio_stream.start_stream()
             self._output_audio_stream.write(audio_data)
         finally:
             self._output_audio_stream.stop_stream()
+
+
+class DialogflowCXStreaming:
+    """Manages the interaction with the Dialogflow CX Streaming API."""
+
+    def __init__(
+        self,
+        agent_name: str,
+        language_code: str,
+        single_utterance: bool,
+        model: str | None,
+        voice: str | None,
+        sample_rate: int,
+        dialogflow_timeout: float,
+        debug: bool,
+    ) -> None:
+        """Initializes the Dialogflow CX Streaming API client."""
+        try:
+            _, project, _, location, _, agent_id = agent_name.split("/")
+        except ValueError:
+            raise ValueError(
+                "Invalid agent name format. Expected format: projects/<project>/locations/<location>/agents/<agent_id>"
+            )
+        if location != "global":
+            client_options = ClientOptions(
+                api_endpoint=f"{location}-dialogflow.googleapis.com",
+                quota_project_id=project,
+            )
+        else:
+            client_options = ClientOptions(quota_project_id=project)
+
+        self.client = dialogflowcx_v3.SessionsAsyncClient(client_options=client_options)
+        self.agent_name = agent_name
+        self.language_code = language_code
+        self.single_utterance = single_utterance
+        self.model = model
+        self.session_id = str(uuid.uuid4())
+        self.dialogflow_timeout = dialogflow_timeout
+        self.debug = debug
+        self.sample_rate = sample_rate
+        self.voice = voice
+
+        if self.debug:
+            logger.setLevel(logging.DEBUG)
+            logger.debug("Debug logging enabled")
+
+    async def generate_streaming_detect_intent_requests(
+        self, audio_queue: asyncio.Queue
+    ) -> AsyncGenerator[dialogflowcx_v3.StreamingDetectIntentRequest, None]:
+        """Generates the requests for the streaming API."""
+        audio_config = dialogflowcx_v3.InputAudioConfig(
+            audio_encoding=dialogflowcx_v3.AudioEncoding.AUDIO_ENCODING_LINEAR_16,
+            sample_rate_hertz=self.sample_rate,
+            model=self.model,
+            single_utterance=self.single_utterance,
+        )
+        query_input = dialogflowcx_v3.QueryInput(
+            language_code=self.language_code,
+            audio=dialogflowcx_v3.AudioInput(config=audio_config),
+        )
+        output_audio_config = dialogflowcx_v3.OutputAudioConfig(
+            audio_encoding=dialogflowcx_v3.OutputAudioEncoding.OUTPUT_AUDIO_ENCODING_LINEAR_16,
+            sample_rate_hertz=self.sample_rate,
+            synthesize_speech_config=(
+                dialogflowcx_v3.SynthesizeSpeechConfig(
+                    voice=dialogflowcx_v3.VoiceSelectionParams(name=self.voice)
+                )
+                if self.voice
+                else None
+            ),
+        )
+
+        # First request contains session ID, query input audio config, and output audio config
+        request = dialogflowcx_v3.StreamingDetectIntentRequest(
+            session=f"{self.agent_name}/sessions/{self.session_id}",
+            query_input=query_input,
+            enable_partial_response=True,
+            output_audio_config=output_audio_config,
+        )
+        if self.debug:
+            logger.debug(f"Sending initial request: {request}")
+        yield request
+
+        # Subsequent requests contain audio only
+        while True:
+            try:
+                chunk = await audio_queue.get()
+                if chunk is None:
+                    logger.debug(
+                        "[generate_streaming_detect_intent_requests] Received None chunk, signaling end of utterance"
+                    )
+                    break  # Exit the generator
+
+                request = dialogflowcx_v3.StreamingDetectIntentRequest(
+                    query_input=dialogflowcx_v3.QueryInput(
+                        audio=dialogflowcx_v3.AudioInput(audio=chunk)
+                    )
+                )
+                yield request
+
+            except asyncio.CancelledError:
+                logger.debug(
+                    "[generate_streaming_detect_intent_requests] Audio queue processing was cancelled"
+                )
+                break
+
+    async def streaming_detect_intent(
+        self,
+        audio_queue: asyncio.Queue,
+    ) -> AsyncGenerator[dialogflowcx_v3.StreamingDetectIntentResponse, None]:
+        """Transcribes the audio into text and yields each response."""
+        requests_generator = self.generate_streaming_detect_intent_requests(audio_queue)
+
+        retry_policy = retries.AsyncRetry(
+            predicate=retries.if_exception_type(ServiceUnavailable),
+            initial=0.5,
+            maximum=60.0,
+            multiplier=2.0,
+            timeout=300.0,
+            on_error=lambda e: logger.warning(f"Retrying due to error: {e}"),
+        )
+
+        async def streaming_request_with_retry() -> (
+            AsyncGenerator[dialogflowcx_v3.StreamingDetectIntentResponse, None]
+        ):
+            async def api_call():
+                logger.debug("Initiating streaming request")
+                return await self.client.streaming_detect_intent(
+                    requests=requests_generator
+                )
+
+            response_stream = await retry_policy(api_call)()
+            return response_stream
+
+        try:
+            responses = await streaming_request_with_retry()
+
+            # Use async for to iterate over the responses, WITH timeout
+            response_iterator = responses.__aiter__()  # Get the iterator
+            while True:
+                try:
+                    response = await asyncio.wait_for(
+                        response_iterator.__anext__(), timeout=self.dialogflow_timeout
+                    )
+                    if self.debug and response:
+                        response_copy = MessageToDict(response._pb)
+                        if response_copy.get("detectIntentResponse"):
+                            response_copy["detectIntentResponse"][
+                                "outputAudio"
+                            ] = "REMOVED"
+                        logger.debug(f"Received response: {response_copy}")
+                    yield response
+                except StopAsyncIteration:
+                    logger.debug("End of response stream")
+                    break
+                except asyncio.TimeoutError:
+                    logger.warning("Timeout waiting for response from Dialogflow.")
+                    continue  # Continue to the next iteration, don't break
+                except GoogleAPIError as e:  # Keep error handling
+                    logger.error(f"Error: {e}")
+                    if e.code == 500:  # Consider making this more robust
+                        logger.warning("Encountered a 500 error during iteration.")
+
+        except GoogleAPIError as e:
+            logger.error(f"Error: {e}")
+            if e.code == 500:
+                logger.warning("Encountered a 500 error during iteration.")
+
+
+async def push_to_audio_queue(
+    audio_generator: AsyncGenerator, audio_queue: asyncio.Queue
+) -> None:
+    """Pushes audio chunks from a generator to an asyncio queue."""
+    try:
+        async for chunk in audio_generator:
+            await audio_queue.put(chunk)
+    except Exception as e:
+        logger.error(f"Error in push_to_audio_queue: {e}")
+
+
+async def listen_print_loop(
+    responses: AsyncGenerator[dialogflowcx_v3.StreamingDetectIntentResponse, None],
+    audioIO: AudioIO,
+    audio_queue: asyncio.Queue,
+    dialogflow_timeout: float,
+) -> bool:
+    """Iterates through server responses and prints them."""
+    response_iterator = responses.__aiter__()
+    while True:
+        try:
+            response = await asyncio.wait_for(
+                response_iterator.__anext__(), timeout=dialogflow_timeout
+            )
+
+            if (
+                response
+                and response.detect_intent_response
+                and response.detect_intent_response.output_audio
+            ):
+                audioIO.play_audio(response.detect_intent_response.output_audio)
+
+            if (
+                response
+                and response.detect_intent_response
+                and response.detect_intent_response.query_result
+            ):
+                query_result = response.detect_intent_response.query_result
+                # Check for end_interaction in response messages
+                if query_result.response_messages:
+                    for message in query_result.response_messages:
+                        if message.text:
+                            logger.info(f"Dialogflow output: {message.text.text[0]}")
+                        if message._pb.HasField("end_interaction"):
+                            logger.info("End interaction detected.")
+                            return False  # Signal to *not* restart the loop (exit)
+
+                if query_result.intent and query_result.intent.display_name:
+                    logger.info(f"Detected intent: {query_result.intent.display_name}")
+
+                # ensure audio stream restarts
+                return True
+            elif response and response.recognition_result:
+                transcript = response.recognition_result.transcript
+                if transcript:
+                    if response.recognition_result.is_final:
+                        logger.info(f"Final transcript: {transcript}")
+                        await audio_queue.put(None)  # Signal end of input
+                    else:
+                        print(
+                            colored(transcript, "yellow"),
+                            end="\r",
+                        )
+            else:
+                logger.debug("No transcript in recognition result.")
+
+        except StopAsyncIteration:
+            logger.debug("End of response stream in listen_print_loop")
+            break
+        except asyncio.TimeoutError:
+            logger.warning("Timeout waiting for response in listen_print_loop")
+            continue  # Crucial: Continue, don't return, on timeout
+        except Exception as e:
+            logger.error(f"Error in listen_print_loop: {e}")
+            return False  # Exit on any error within the loop
+
+    return True  # Always return after the async for loop completes
+
+
+async def handle_audio_input_output(
+    dialogflow_streaming: DialogflowCXStreaming,
+    audioIO: AudioIO,
+    audio_queue: asyncio.Queue,
+) -> None:
+    """Handles audio input and output concurrently."""
+
+    async def cancel_push_task(push_task: asyncio.Task | None) -> None:
+        """Helper function to cancel push task safely."""
+        if push_task is not None and not push_task.done():
+            push_task.cancel()
+            try:
+                await push_task
+            except asyncio.CancelledError:
+                logger.debug("Push task cancelled successfully")
+
+    push_task = None
+    try:
+        push_task = asyncio.create_task(
+            push_to_audio_queue(audioIO.generator(), audio_queue)
+        )
+        while True:  # restart streaming here.
+            responses = dialogflow_streaming.streaming_detect_intent(audio_queue)
+
+            should_continue = await listen_print_loop(
+                responses,
+                audioIO,
+                audio_queue,
+                dialogflow_streaming.dialogflow_timeout,
+            )
+            if not should_continue:
+                logger.debug(
+                    "End interaction detected, exiting handle_audio_input_output"
+                )
+                await cancel_push_task(push_task)
+                break  # exit while loop
+
+            logger.debug("Restarting audio streaming loop")
+
+    except asyncio.CancelledError:
+        logger.warning("Handling of audio input/output was cancelled.")
+        await cancel_push_task(push_task)
+    except Exception as e:
+        logger.error(f"An unexpected error occurred: {e}")
 
 
 async def main(
@@ -226,11 +595,13 @@ async def main(
         logger.info(f"Using input device: {audioIO.input_device_name}")
     logger.info(f"Using output device: {audioIO.output_device_name}")
 
+    # Signal handler function
     def signal_handler(sig: int, frame: any) -> None:
         print(colored("\nExiting gracefully...", "yellow"))
-        audioIO.closed = True
+        audioIO.closed = True  # Signal to stop the main loop
         sys.exit(0)
 
+    # Set the signal handler for Ctrl+C (SIGINT)
     signal.signal(signal.SIGINT, signal_handler)
 
     with audioIO:
@@ -238,6 +609,7 @@ async def main(
         audio_queue = asyncio.Queue()
 
         try:
+            # Apply overall timeout to the entire interaction
             await asyncio.wait_for(
                 handle_audio_input_output(dialogflow_streaming, audioIO, audio_queue),
                 timeout=dialogflow_streaming.dialogflow_timeout,
@@ -297,7 +669,7 @@ if __name__ == "__main__":
         "--audio_file",
         type=str,
         default=None,
-        help="Path to PCM audio file to use as input instead of microphone",
+        help="Path to WAV audio file to use as input instead of microphone",
     )
 
     args = parser.parse_args()
@@ -314,4 +686,3 @@ if __name__ == "__main__":
             args.audio_file,
         )
     )
-
