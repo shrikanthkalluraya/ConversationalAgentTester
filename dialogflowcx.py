@@ -170,6 +170,11 @@ class AudioIO:
                 # Calculate frames to read per chunk
                 frames_per_chunk = self.chunk_size
                 
+                # Calculate sleep time based on chunk duration (in seconds)
+                chunk_duration = frames_per_chunk / framerate
+                
+                logger.info(f"Chunk duration: {chunk_duration} seconds, Frames per chunk: {frames_per_chunk}")
+                
                 while not self.closed:
                     # Read frames from WAV file
                     pcm_data = wav_file.readframes(frames_per_chunk)
@@ -178,14 +183,14 @@ class AudioIO:
                         logger.info("Reached end of WAV file")
                         break
                     
-                    # Only add to buffer when output stream is stopped (same logic as microphone)
-                    if self._output_audio_stream and self._output_audio_stream.is_stopped():
-                        await self._buff.put(pcm_data)
-                    
+                    # Add to buffer regardless of output stream state
+                    # (removed the condition that was blocking when output is playing)
+                    await self._buff.put(pcm_data)
                     self.audio_input.append(pcm_data)
                     
-                    # Simulate real-time playback timing
-                    await asyncio.sleep(len(pcm_data) / (sample_width * channels * framerate))
+                    # Simulate real-time playback timing with more accurate calculation
+                    # Sleep for the duration of the audio chunk to simulate real-time streaming
+                    await asyncio.sleep(chunk_duration)
                 
                 # Signal end of audio
                 await self._buff.put(None)
@@ -197,6 +202,7 @@ class AudioIO:
             logger.error(f"Audio file not found: {self.audio_file_path}")
         except Exception as e:
             logger.error(f"Error reading audio file: {e}")
+
 
     def _fill_buffer(
         self, in_data: bytes, frame_count: int, time_info: dict, status_flags: int
