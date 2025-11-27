@@ -190,3 +190,128 @@ class AudioIO:
             self._output_audio_stream.write(audio_data)
         finally:
             self._output_audio_stream.stop_stream()
+
+
+async def main(
+    agent_name: str,
+    language_code: str = DEFAULT_LANGUAGE_CODE,
+    single_utterance: bool = False,
+    model: str | None = None,
+    voice: str | None = None,
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+    dialogflow_timeout: float = DEFAULT_DIALOGFLOW_TIMEOUT,
+    debug: bool = False,
+    audio_file: str | None = None,  # New parameter
+) -> None:
+    """Start bidirectional streaming from microphone input or audio file to speech API"""
+
+    chunk_size = int(sample_rate * CHUNK_SECONDS)
+
+    audioIO = AudioIO(sample_rate, chunk_size, audio_file_path=audio_file)
+    dialogflow_streaming = DialogflowCXStreaming(
+        agent_name,
+        language_code,
+        single_utterance,
+        model,
+        voice,
+        sample_rate,
+        dialogflow_timeout,
+        debug,
+    )
+
+    logger.info(f"Chunk size: {audioIO.chunk_size}")
+    if audio_file:
+        logger.info(f"Using audio file: {audio_file}")
+    else:
+        logger.info(f"Using input device: {audioIO.input_device_name}")
+    logger.info(f"Using output device: {audioIO.output_device_name}")
+
+    def signal_handler(sig: int, frame: any) -> None:
+        print(colored("\nExiting gracefully...", "yellow"))
+        audioIO.closed = True
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+
+    with audioIO:
+        logger.info(f"NEW REQUEST: {get_current_time() / 1000}")
+        audio_queue = asyncio.Queue()
+
+        try:
+            await asyncio.wait_for(
+                handle_audio_input_output(dialogflow_streaming, audioIO, audio_queue),
+                timeout=dialogflow_streaming.dialogflow_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                f"Dialogflow interaction timed out after {dialogflow_streaming.dialogflow_timeout} seconds."
+            )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("agent_name", help="Agent Name")
+    parser.add_argument(
+        "--language_code",
+        type=str,
+        default=DEFAULT_LANGUAGE_CODE,
+        help="Specify the language code (default: en-US)",
+    )
+    parser.add_argument(
+        "--single_utterance",
+        action="store_true",
+        help="Enable single utterance mode (default: False)",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Specify the speech recognition model to use (default: None)",
+    )
+    parser.add_argument(
+        "--voice",
+        type=str,
+        default=None,
+        help="Specify the voice for output audio (default: None)",
+    )
+    parser.add_argument(
+        "--sample_rate",
+        type=int,
+        default=DEFAULT_SAMPLE_RATE,
+        help="Specify the sample rate in Hz (default: 16000)",
+    )
+    parser.add_argument(
+        "--dialogflow_timeout",
+        type=float,
+        default=DEFAULT_DIALOGFLOW_TIMEOUT,
+        help="Specify the Dialogflow API timeout in seconds (default: 60)",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging",
+    )
+    parser.add_argument(
+        "--audio_file",
+        type=str,
+        default=None,
+        help="Path to PCM audio file to use as input instead of microphone",
+    )
+
+    args = parser.parse_args()
+    asyncio.run(
+        main(
+            args.agent_name,
+            args.language_code,
+            args.single_utterance,
+            args.model,
+            args.voice,
+            args.sample_rate,
+            args.dialogflow_timeout,
+            args.debug,
+            args.audio_file,
+        )
+    )
+
