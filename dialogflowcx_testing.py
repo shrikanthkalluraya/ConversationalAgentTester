@@ -5,13 +5,12 @@ import asyncio
 from collections.abc import AsyncGenerator
 import logging
 import os
-import struct
 import sys
 import time
 import uuid
 import wave
 from pathlib import Path
-from typing import Callable, Any
+from typing import Any
 
 from google.api_core import retry as retries
 from google.api_core.client_options import ClientOptions
@@ -31,7 +30,6 @@ CHUNK_SECONDS = 0.1
 DEFAULT_LANGUAGE_CODE = "en-US"
 DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_DIALOGFLOW_TIMEOUT = 60.0
-STREAMING_DELAY_RATIO = 1.0  # Real-time streaming (no artificial delay)
 
 
 def get_current_time() -> int:
@@ -39,116 +37,76 @@ def get_current_time() -> int:
     return int(round(time.time() * 1000))
 
 
-class WavFileReader:
-    """Reads WAV files and streams them as audio chunks."""
+class WavFileStreamer:
+    """Streams WAV files mimicking real-time microphone input."""
 
-    def __init__(self, wav_file_path: str, chunk_size: int, streaming_delay_ratio: float = 1.0) -> None:
+    def __init__(self, wav_file_path: str, rate: int, chunk_size: int) -> None:
         self.wav_file_path = wav_file_path
+        self._rate = rate
         self.chunk_size = chunk_size
-        self.streaming_delay_ratio = streaming_delay_ratio
-        self._buff = asyncio.Queue(maxsize=10)  # Limit buffer size
         self.closed = False
         self.start_time = None
-        self._read_started = asyncio.Event()
-
-    def __enter__(self) -> "WavFileReader":
-        """Opens the WAV file."""
-        self.closed = False
-        return self
-
-    def __exit__(self, *args: any) -> None:
-        """Closes resources."""
-        self.closed = True
-        self._buff.put_nowait(None)
-
-    async def read_wav_file(self) -> None:
-        """Reads WAV file and pushes chunks to buffer with precise real-time timing."""
+        self._audio_data = []
+        self._current_index = 0
+        
+        # Pre-load and validate WAV file
         try:
-            with wave.open(self.wav_file_path, "rb") as wf:
-                # Validate WAV format
+            with wave.open(wav_file_path, "rb") as wf:
                 if wf.getsampwidth() != 2:
-                    raise ValueError(f"WAV file must be 16-bit PCM, got {wf.getsampwidth() * 8}-bit")
+                    raise ValueError(f"WAV must be 16-bit PCM, got {wf.getsampwidth() * 8}-bit")
                 if wf.getnchannels() != 1:
-                    raise ValueError(f"WAV file must be mono, got {wf.getnchannels()} channels")
+                    raise ValueError(f"WAV must be mono, got {wf.getnchannels()} channels")
                 
-                logger.info(f"Reading WAV file: {self.wav_file_path}")
+                logger.info(f"Loading WAV: {wav_file_path}")
                 logger.info(f"Sample rate: {wf.getframerate()} Hz, Duration: {wf.getnframes() / wf.getframerate():.2f}s")
                 
-                self.start_time = get_current_time()
-                self._read_started.set()  # Signal that reading has started
-                
-                # Calculate precise timing for streaming
-                chunk_duration = CHUNK_SECONDS * self.streaming_delay_ratio
-                start_time = asyncio.get_event_loop().time()
-                chunk_index = 0
-                
-                while not self.closed:
-                    # Calculate when this chunk should be sent
-                    target_time = start_time + (chunk_index * chunk_duration)
-                    current_time = asyncio.get_event_loop().time()
-                    
-                    # Wait until it's time to send this chunk
-                    sleep_time = target_time - current_time
-                    if sleep_time > 0:
-                        await asyncio.sleep(sleep_time)
-                    
-                    # Read and send the chunk
+                # Read all audio data into chunks
+                while True:
                     data = wf.readframes(self.chunk_size)
                     if not data:
                         break
-                    
-                    try:
-                        await asyncio.wait_for(self._buff.put(data), timeout=5.0)
-                    except asyncio.TimeoutError:
-                        logger.error("Buffer full, dropping audio chunk")
-                        break
-                    
-                    chunk_index += 1
+                    self._audio_data.append(data)
                 
-                # Signal end of file
-                await self._buff.put(None)
-                logger.info(f"Finished reading WAV file: {self.wav_file_path}")
+                logger.info(f"Loaded {len(self._audio_data)} chunks from WAV file")
                 
-        except FileNotFoundError:
-            logger.error(f"WAV file not found: {self.wav_file_path}")
-            self._read_started.set()
-            await self._buff.put(None)
         except Exception as e:
-            logger.error(f"Error reading WAV file: {e}")
-            self._read_started.set()
-            await self._buff.put(None)
+            logger.error(f"Error loading WAV file: {e}")
+            raise
+
+    def __enter__(self) -> "WavFileStreamer":
+        """Opens the stream."""
+        self.closed = False
+        self._current_index = 0
+        self.start_time = get_current_time()
+        return self
+
+    def __exit__(self, *args: any) -> None:
+        """Closes the stream and releases resources."""
+        self.closed = True
 
     async def generator(self) -> AsyncGenerator[bytes, None]:
-        """Stream audio chunks from WAV file."""
-        # Wait for reading to start
-        await self._read_started.wait()
+        """Stream audio chunks with real-time timing."""
+        logger.info("Starting audio streaming...")
         
-        while not self.closed:
-            try:
-                chunk = await asyncio.wait_for(self._buff.get(), timeout=1)
-
-                if chunk is None:
-                    logger.debug("[generator] Received None chunk, ending stream")
-                    return
-
-                # Batch multiple chunks if available for efficiency
-                data = [chunk]
-                while True:
-                    try:
-                        chunk = self._buff.get_nowait()
-                        if chunk is None:
-                            logger.debug("[generator] Received None chunk (nowait), ending stream")
-                            return
-                        data.append(chunk)
-                    except asyncio.QueueEmpty:
-                        break
-
-                combined_data = b"".join(data)
-                yield combined_data
-
-            except asyncio.TimeoutError:
-                # Continue waiting for more audio
-                continue
+        start_time = time.time()
+        chunk_duration = CHUNK_SECONDS
+        
+        for idx, chunk in enumerate(self._audio_data):
+            if self.closed:
+                break
+            
+            # Calculate when this chunk should be sent (real-time)
+            target_time = start_time + (idx * chunk_duration)
+            current_time = time.time()
+            
+            # Wait until it's time to send this chunk
+            sleep_time = target_time - current_time
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
+            
+            yield chunk
+        
+        logger.info(f"Finished streaming {len(self._audio_data)} chunks")
 
 
 class DialogflowResponse:
@@ -209,7 +167,7 @@ class DialogflowCXStreaming:
             logger.debug("Debug logging enabled")
 
     async def generate_streaming_detect_intent_requests(
-        self, audio_queue: asyncio.Queue
+        self, audio_generator: AsyncGenerator[bytes, None]
     ) -> AsyncGenerator[dialogflowcx_v3.StreamingDetectIntentRequest, None]:
         """Generates the requests for the streaming API."""
         audio_config = dialogflowcx_v3.InputAudioConfig(
@@ -234,7 +192,7 @@ class DialogflowCXStreaming:
             ),
         )
 
-        # First request
+        # First request contains session ID, query input audio config, and output audio config
         request = dialogflowcx_v3.StreamingDetectIntentRequest(
             session=f"{self.agent_name}/sessions/{self.session_id}",
             query_input=query_input,
@@ -246,30 +204,23 @@ class DialogflowCXStreaming:
         yield request
 
         # Subsequent requests contain audio only
-        while True:
-            try:
-                chunk = await audio_queue.get()
-                if chunk is None:
-                    logger.debug("[generate_streaming_detect_intent_requests] End of utterance")
-                    break
-
-                request = dialogflowcx_v3.StreamingDetectIntentRequest(
-                    query_input=dialogflowcx_v3.QueryInput(
-                        audio=dialogflowcx_v3.AudioInput(audio=chunk)
-                    )
+        async for chunk in audio_generator:
+            if self.debug:
+                logger.debug(f"Sending audio chunk: {len(chunk)} bytes")
+            
+            request = dialogflowcx_v3.StreamingDetectIntentRequest(
+                query_input=dialogflowcx_v3.QueryInput(
+                    audio=dialogflowcx_v3.AudioInput(audio=chunk)
                 )
-                yield request
-
-            except asyncio.CancelledError:
-                logger.debug("[generate_streaming_detect_intent_requests] Cancelled")
-                break
+            )
+            yield request
 
     async def streaming_detect_intent(
         self,
-        audio_queue: asyncio.Queue,
+        audio_generator: AsyncGenerator[bytes, None],
     ) -> AsyncGenerator[dialogflowcx_v3.StreamingDetectIntentResponse, None]:
         """Transcribes the audio into text and yields each response."""
-        requests_generator = self.generate_streaming_detect_intent_requests(audio_queue)
+        requests_generator = self.generate_streaming_detect_intent_requests(audio_generator)
 
         retry_policy = retries.AsyncRetry(
             predicate=retries.if_exception_type(ServiceUnavailable),
@@ -282,6 +233,7 @@ class DialogflowCXStreaming:
 
         async def streaming_request_with_retry():
             async def api_call():
+                logger.debug("Initiating streaming request")
                 return await self.client.streaming_detect_intent(requests=requests_generator)
             response_stream = await retry_policy(api_call)()
             return response_stream
@@ -316,42 +268,22 @@ class DialogflowCXStreaming:
             logger.error(f"Error: {e}")
 
 
-async def push_to_audio_queue(
-    audio_generator: AsyncGenerator, audio_queue: asyncio.Queue
-) -> None:
-    """Pushes audio chunks from a generator to an asyncio queue."""
-    try:
-        async for chunk in audio_generator:
-            await audio_queue.put(chunk)
-    except Exception as e:
-        logger.error(f"Error in push_to_audio_queue: {e}")
-
-
 async def process_wav_file(
     dialogflow_streaming: DialogflowCXStreaming,
     wav_file_path: str,
     chunk_size: int,
-    streaming_delay_ratio: float = 1.0,
 ) -> DialogflowResponse:
     """Process a single WAV file and return the response."""
     
     result = DialogflowResponse()
-    audio_queue = asyncio.Queue()
     
-    with WavFileReader(wav_file_path, chunk_size, streaming_delay_ratio) as wav_reader:
-        # Start reading WAV file in background
-        read_task = asyncio.create_task(wav_reader.read_wav_file())
-        
-        # Wait for reading to start
-        await wav_reader._read_started.wait()
-        
-        # Start streaming to API immediately
-        push_task = asyncio.create_task(
-            push_to_audio_queue(wav_reader.generator(), audio_queue)
-        )
-        
+    with WavFileStreamer(wav_file_path, dialogflow_streaming.sample_rate, chunk_size) as streamer:
         try:
-            responses = dialogflow_streaming.streaming_detect_intent(audio_queue)
+            # Create audio generator
+            audio_gen = streamer.generator()
+            
+            # Start streaming to Dialogflow
+            responses = dialogflow_streaming.streaming_detect_intent(audio_gen)
             response_iterator = responses.__aiter__()
             
             while True:
@@ -403,18 +335,11 @@ async def process_wav_file(
                     break
                 except asyncio.TimeoutError:
                     logger.warning("Timeout waiting for response")
-                    continue
+                    break
         
-        finally:
-            # Cancel tasks
-            wav_reader.closed = True
-            for task in [read_task, push_task]:
-                if not task.done():
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
+        except Exception as e:
+            logger.error(f"Error processing WAV file: {e}")
+            raise
     
     return result
 
@@ -426,11 +351,9 @@ class TestFlowManager:
         self,
         dialogflow_streaming: DialogflowCXStreaming,
         chunk_size: int,
-        streaming_delay_ratio: float = 1.0,
     ):
         self.dialogflow_streaming = dialogflow_streaming
         self.chunk_size = chunk_size
-        self.streaming_delay_ratio = streaming_delay_ratio
         self.responses: list[DialogflowResponse] = []
     
     async def send_audio(self, wav_file_path: str) -> DialogflowResponse:
@@ -442,8 +365,7 @@ class TestFlowManager:
         response = await process_wav_file(
             self.dialogflow_streaming,
             wav_file_path,
-            self.chunk_size,
-            self.streaming_delay_ratio
+            self.chunk_size
         )
         
         self.responses.append(response)
@@ -561,7 +483,6 @@ async def main(
     voice: str | None = None,
     sample_rate: int = DEFAULT_SAMPLE_RATE,
     dialogflow_timeout: float = DEFAULT_DIALOGFLOW_TIMEOUT,
-    streaming_delay_ratio: float = STREAMING_DELAY_RATIO,
     debug: bool = False,
 ) -> None:
     """Main function to run WAV file testing."""
@@ -579,7 +500,7 @@ async def main(
         debug,
     )
     
-    flow_manager = TestFlowManager(dialogflow_streaming, chunk_size, streaming_delay_ratio)
+    flow_manager = TestFlowManager(dialogflow_streaming, chunk_size)
     
     logger.info(f"Starting test flow at {get_current_time() / 1000}")
     logger.info(f"Session ID: {dialogflow_streaming.session_id}")
@@ -655,12 +576,6 @@ if __name__ == "__main__":
         help="Dialogflow API timeout in seconds (default: 60)",
     )
     parser.add_argument(
-        "--streaming_delay_ratio",
-        type=float,
-        default=STREAMING_DELAY_RATIO,
-        help="Audio streaming speed ratio (default: 1.0 = real-time, <1.0 = faster, >1.0 = slower)",
-    )
-    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
@@ -678,7 +593,6 @@ if __name__ == "__main__":
             args.voice,
             args.sample_rate,
             args.dialogflow_timeout,
-            args.streaming_delay_ratio,
             args.debug,
         )
     )
