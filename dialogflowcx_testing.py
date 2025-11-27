@@ -31,7 +31,7 @@ CHUNK_SECONDS = 0.1
 DEFAULT_LANGUAGE_CODE = "en-US"
 DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_DIALOGFLOW_TIMEOUT = 60.0
-STREAMING_DELAY_RATIO = 0.8  # Send audio slightly faster than real-time
+STREAMING_DELAY_RATIO = 1.0  # Real-time streaming (no artificial delay)
 
 
 def get_current_time() -> int:
@@ -42,13 +42,14 @@ def get_current_time() -> int:
 class WavFileReader:
     """Reads WAV files and streams them as audio chunks."""
 
-    def __init__(self, wav_file_path: str, chunk_size: int, streaming_delay_ratio: float = 0.8) -> None:
+    def __init__(self, wav_file_path: str, chunk_size: int, streaming_delay_ratio: float = 1.0) -> None:
         self.wav_file_path = wav_file_path
         self.chunk_size = chunk_size
         self.streaming_delay_ratio = streaming_delay_ratio
-        self._buff = asyncio.Queue()
+        self._buff = asyncio.Queue(maxsize=10)  # Limit buffer size
         self.closed = False
         self.start_time = None
+        self._read_started = asyncio.Event()
 
     def __enter__(self) -> "WavFileReader":
         """Opens the WAV file."""
@@ -61,7 +62,7 @@ class WavFileReader:
         self._buff.put_nowait(None)
 
     async def read_wav_file(self) -> None:
-        """Reads WAV file and pushes chunks to buffer."""
+        """Reads WAV file and pushes chunks to buffer with precise real-time timing."""
         try:
             with wave.open(self.wav_file_path, "rb") as wf:
                 # Validate WAV format
@@ -74,19 +75,35 @@ class WavFileReader:
                 logger.info(f"Sample rate: {wf.getframerate()} Hz, Duration: {wf.getnframes() / wf.getframerate():.2f}s")
                 
                 self.start_time = get_current_time()
+                self._read_started.set()  # Signal that reading has started
                 
-                # Stream audio close to real-time to avoid "Audio timeout" errors
-                # Use the configured delay ratio (default 0.8 = 80% of real-time = slightly faster)
+                # Calculate precise timing for streaming
                 chunk_duration = CHUNK_SECONDS * self.streaming_delay_ratio
+                start_time = asyncio.get_event_loop().time()
+                chunk_index = 0
                 
                 while not self.closed:
+                    # Calculate when this chunk should be sent
+                    target_time = start_time + (chunk_index * chunk_duration)
+                    current_time = asyncio.get_event_loop().time()
+                    
+                    # Wait until it's time to send this chunk
+                    sleep_time = target_time - current_time
+                    if sleep_time > 0:
+                        await asyncio.sleep(sleep_time)
+                    
+                    # Read and send the chunk
                     data = wf.readframes(self.chunk_size)
                     if not data:
                         break
                     
-                    await self._buff.put(data)
-                    # Send audio close to real-time to avoid timeout
-                    await asyncio.sleep(chunk_duration)
+                    try:
+                        await asyncio.wait_for(self._buff.put(data), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        logger.error("Buffer full, dropping audio chunk")
+                        break
+                    
+                    chunk_index += 1
                 
                 # Signal end of file
                 await self._buff.put(None)
@@ -94,13 +111,18 @@ class WavFileReader:
                 
         except FileNotFoundError:
             logger.error(f"WAV file not found: {self.wav_file_path}")
+            self._read_started.set()
             await self._buff.put(None)
         except Exception as e:
             logger.error(f"Error reading WAV file: {e}")
+            self._read_started.set()
             await self._buff.put(None)
 
     async def generator(self) -> AsyncGenerator[bytes, None]:
         """Stream audio chunks from WAV file."""
+        # Wait for reading to start
+        await self._read_started.wait()
+        
         while not self.closed:
             try:
                 chunk = await asyncio.wait_for(self._buff.get(), timeout=1)
@@ -109,8 +131,8 @@ class WavFileReader:
                     logger.debug("[generator] Received None chunk, ending stream")
                     return
 
+                # Batch multiple chunks if available for efficiency
                 data = [chunk]
-
                 while True:
                     try:
                         chunk = self._buff.get_nowait()
@@ -125,7 +147,7 @@ class WavFileReader:
                 yield combined_data
 
             except asyncio.TimeoutError:
-                logger.debug("[generator] No audio chunk received within timeout, continuing...")
+                # Continue waiting for more audio
                 continue
 
 
@@ -309,7 +331,7 @@ async def process_wav_file(
     dialogflow_streaming: DialogflowCXStreaming,
     wav_file_path: str,
     chunk_size: int,
-    streaming_delay_ratio: float = 0.8,
+    streaming_delay_ratio: float = 1.0,
 ) -> DialogflowResponse:
     """Process a single WAV file and return the response."""
     
@@ -317,8 +339,13 @@ async def process_wav_file(
     audio_queue = asyncio.Queue()
     
     with WavFileReader(wav_file_path, chunk_size, streaming_delay_ratio) as wav_reader:
-        # Start reading WAV file
+        # Start reading WAV file in background
         read_task = asyncio.create_task(wav_reader.read_wav_file())
+        
+        # Wait for reading to start
+        await wav_reader._read_started.wait()
+        
+        # Start streaming to API immediately
         push_task = asyncio.create_task(
             push_to_audio_queue(wav_reader.generator(), audio_queue)
         )
@@ -399,7 +426,7 @@ class TestFlowManager:
         self,
         dialogflow_streaming: DialogflowCXStreaming,
         chunk_size: int,
-        streaming_delay_ratio: float = 0.8,
+        streaming_delay_ratio: float = 1.0,
     ):
         self.dialogflow_streaming = dialogflow_streaming
         self.chunk_size = chunk_size
@@ -631,7 +658,7 @@ if __name__ == "__main__":
         "--streaming_delay_ratio",
         type=float,
         default=STREAMING_DELAY_RATIO,
-        help="Audio streaming speed ratio (default: 0.8 = 80%% of real-time, faster to avoid timeout)",
+        help="Audio streaming speed ratio (default: 1.0 = real-time, <1.0 = faster, >1.0 = slower)",
     )
     parser.add_argument(
         "--debug",
